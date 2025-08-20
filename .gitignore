@@ -5,3 +5,7 @@ terraform/kubeconfigs/
 readme_pdhlo.md
 readme_padhlo.md
 helm/redis-lite/readme_pdhlo.md
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/*.tfstate.*
+terraform/logs/
