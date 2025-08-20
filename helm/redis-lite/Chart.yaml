@@ -1,0 +1,5 @@
+apiVersion: v2
+name: redis-lite
+version: 0.1.0
+appVersion: "7"
+description: Minimal Redis for PR-DR replication demo

@@ -1,0 +1,7 @@
+.DS_Store
+logs/
+terraform/.terraform/
+terraform/kubeconfigs/
+readme_pdhlo.md
+readme_padhlo.md
+helm/redis-lite/readme_pdhlo.md

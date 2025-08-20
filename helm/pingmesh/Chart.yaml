@@ -1,0 +1,5 @@
+apiVersion: v2
+name: pingmesh
+version: 0.1.0
+appVersion: "1.0.0"
+description: Busybox-based mesh that can ping peers via headless service

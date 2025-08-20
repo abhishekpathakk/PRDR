@@ -1,0 +1,207 @@
+---
+- name: PR-DR failover orchestrator
+  hosts: localhost
+  gather_facts: false
+  vars:
+    is_failed: false
+    pr_kubeconfig: "{{ playbook_dir }}/../terraform/kubeconfigs/pr.yaml"
+    dr_kubeconfig: "{{ playbook_dir }}/../terraform/kubeconfigs/dr.yaml"
+    namespace: mesh
+    release_name: pingmesh
+    chart_path: "{{ playbook_dir }}/../helm/pingmesh"
+    replicas_active: 3
+    redis_release: redis
+    redis_chart: "{{ playbook_dir }}/../helm/redis-lite"
+    redis_port: 6379
+  tasks:
+    - name: Ensure namespace exists on PR
+      command: kubectl --kubeconfig {{ pr_kubeconfig }} create namespace {{ namespace }}
+      register: pr_ns
+      failed_when: false
+      changed_when: "'created' in pr_ns.stdout"
+
+    - name: Ensure namespace exists on DR
+      command: kubectl --kubeconfig {{ dr_kubeconfig }} create namespace {{ namespace }}
+      register: dr_ns
+      failed_when: false
+      changed_when: "'created' in dr_ns.stdout"
+
+    - name: Deploy/Update PR release (active when is_failed=false)
+      command: >-
+        helm upgrade --install {{ release_name }} {{ chart_path }}
+        --namespace {{ namespace }}
+        --kubeconfig {{ pr_kubeconfig }}
+        --set replicaCount={{ is_failed | ternary(0, replicas_active) }}
+
+    - name: Deploy/Update DR release (active when is_failed=true)
+      command: >-
+        helm upgrade --install {{ release_name }} {{ chart_path }}
+        --namespace {{ namespace }}
+        --kubeconfig {{ dr_kubeconfig }}
+        --set replicaCount={{ is_failed | ternary(replicas_active, 0) }}
+
+    - name: Wait for active site to be ready
+      vars:
+        active_kubeconfig: "{{ (is_failed | bool) | ternary(dr_kubeconfig, pr_kubeconfig) }}"
+      command: >-
+        kubectl --kubeconfig {{ active_kubeconfig }} -n {{ namespace }}
+        rollout status statefulset/{{ release_name }} --timeout=180s
+
+    - name: Get pod names in active site
+      vars:
+        active_kubeconfig: "{{ (is_failed | bool) | ternary(dr_kubeconfig, pr_kubeconfig) }}"
+      command: >-
+        kubectl --kubeconfig {{ active_kubeconfig }} -n {{ namespace }}
+        get pods -l app={{ release_name }} -o jsonpath='{.items[*].metadata.name}'
+      register: pod_names
+
+    - name: Build pod list
+      set_fact:
+        pods: "{{ pod_names.stdout.split() if pod_names.stdout else [] }}"
+
+    - name: Ping peers from the first pod (DNS by headless service)
+      when: pods | length > 1
+      vars:
+        active_kubeconfig: "{{ (is_failed | bool) | ternary(dr_kubeconfig, pr_kubeconfig) }}"
+      loop: "{{ pods[1:] }}"
+      loop_control:
+        loop_var: target_pod
+      command: >-
+        kubectl --kubeconfig {{ active_kubeconfig }} -n {{ namespace }}
+        exec {{ pods[0] }} -- sh -c
+        'ping -c 2 {{ target_pod }}.{{ release_name }}.{{ namespace }}.svc.cluster.local'
+      register: ping_results
+      changed_when: false
+      ignore_errors: true
+
+    - name: Show ping results
+      when: pods | length > 1
+      debug:
+        var: ping_results.results
+
+    - name: Deploy Redis on PR
+      command: >-
+        helm upgrade --install {{ redis_release }} {{ redis_chart }}
+        --namespace {{ namespace }}
+        --kubeconfig {{ pr_kubeconfig }}
+
+    - name: Deploy Redis on DR
+      command: >-
+        helm upgrade --install {{ redis_release }} {{ redis_chart }}
+        --namespace {{ namespace }}
+        --kubeconfig {{ dr_kubeconfig }}
+
+    - name: Wait for Redis pod on PR
+      command: >-
+        kubectl --kubeconfig {{ pr_kubeconfig }} -n {{ namespace }}
+        rollout status deploy/{{ redis_release }} --timeout=180s
+
+    - name: Wait for Redis pod on DR
+      command: >-
+        kubectl --kubeconfig {{ dr_kubeconfig }} -n {{ namespace }}
+        rollout status deploy/{{ redis_release }} --timeout=180s
+
+    - name: Wait for PR Redis Service external IP
+      shell: >-
+        for i in $(seq 1 40); do
+          ip=$(kubectl --kubeconfig {{ pr_kubeconfig }} -n {{ namespace }} get svc {{ redis_release }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}');
+          host=$(kubectl --kubeconfig {{ pr_kubeconfig }} -n {{ namespace }} get svc {{ redis_release }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}');
+          echo ${ip:-$host};
+          if [ -n "${ip}${host}" ]; then exit 0; fi; sleep 10; done; exit 1
+      register: pr_redis_endpoint
+      changed_when: false
+
+    - name: Wait for DR Redis Service external IP
+      shell: >-
+        for i in $(seq 1 40); do
+          ip=$(kubectl --kubeconfig {{ dr_kubeconfig }} -n {{ namespace }} get svc {{ redis_release }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}');
+          host=$(kubectl --kubeconfig {{ dr_kubeconfig }} -n {{ namespace }} get svc {{ redis_release }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}');
+          echo ${ip:-$host};
+          if [ -n "${ip}${host}" ]; then exit 0; fi; sleep 10; done; exit 1
+      register: dr_redis_endpoint
+      changed_when: false
+
+    - name: Get Redis pod on PR
+      command: >-
+        kubectl --kubeconfig {{ pr_kubeconfig }} -n {{ namespace }}
+        get pods -l app={{ redis_release }} -o jsonpath='{"{\n\"pod\": \""}{.items[0].metadata.name}{"\"}\n"}'
+      register: pr_redis_pod_json
+
+    - name: Get Redis pod on DR
+      command: >-
+        kubectl --kubeconfig {{ dr_kubeconfig }} -n {{ namespace }}
+        get pods -l app={{ redis_release }} -o jsonpath='{"{\n\"pod\": \""}{.items[0].metadata.name}{"\"}\n"}'
+      register: dr_redis_pod_json
+
+    - name: Parse Redis pod names
+      set_fact:
+        pr_redis_pod: "{{ (pr_redis_pod_json.stdout | from_json).pod }}"
+        dr_redis_pod: "{{ (dr_redis_pod_json.stdout | from_json).pod }}"
+
+    - name: Configure Redis replication (PR master, DR replica) when is_failed=false
+      when: not is_failed | bool
+      block:
+        - name: Compute timestamp
+          set_fact:
+            now: "{{ lookup('pipe', 'date -Iseconds') }}"
+
+        - name: Ensure PR is master (replicaof no one)
+          command: >-
+            kubectl --kubeconfig {{ pr_kubeconfig }} -n {{ namespace }}
+            exec {{ pr_redis_pod }} -- sh -c 'redis-cli replicaof no one'
+
+        - name: Point DR to PR as replica
+          vars:
+            master_host: "{{ pr_redis_endpoint.stdout_lines[-1] | trim }}"
+          command: >-
+            kubectl --kubeconfig {{ dr_kubeconfig }} -n {{ namespace }}
+            exec {{ dr_redis_pod }} -- sh -c 'redis-cli replicaof {{ master_host }} {{ redis_port }}'
+
+        - name: Write key on PR
+          command: >-
+            kubectl --kubeconfig {{ pr_kubeconfig }} -n {{ namespace }}
+            exec {{ pr_redis_pod }} -- sh -c 'redis-cli SET prdr:site PR && redis-cli SET prdr:last "{{ now }}"'
+
+        - name: Read key on DR
+          command: >-
+            kubectl --kubeconfig {{ dr_kubeconfig }} -n {{ namespace }}
+            exec {{ dr_redis_pod }} -- sh -c 'redis-cli MGET prdr:site prdr:last'
+          register: dr_readback
+
+        - name: Show DR readback
+          debug:
+            var: dr_readback.stdout_lines
+
+    - name: Configure Redis replication (DR master, PR replica) when is_failed=true
+      when: is_failed | bool
+      block:
+        - name: Compute timestamp
+          set_fact:
+            now: "{{ lookup('pipe', 'date -Iseconds') }}"
+
+        - name: Ensure DR is master (replicaof no one)
+          command: >-
+            kubectl --kubeconfig {{ dr_kubeconfig }} -n {{ namespace }}
+            exec {{ dr_redis_pod }} -- sh -c 'redis-cli replicaof no one'
+
+        - name: Point PR to DR as replica
+          vars:
+            master_host: "{{ dr_redis_endpoint.stdout_lines[-1] | trim }}"
+          command: >-
+            kubectl --kubeconfig {{ pr_kubeconfig }} -n {{ namespace }}
+            exec {{ pr_redis_pod }} -- sh -c 'redis-cli replicaof {{ master_host }} {{ redis_port }}'
+
+        - name: Write key on DR
+          command: >-
+            kubectl --kubeconfig {{ dr_kubeconfig }} -n {{ namespace }}
+            exec {{ dr_redis_pod }} -- sh -c 'redis-cli SET prdr:site DR && redis-cli SET prdr:last "{{ now }}"'
+
+        - name: Read key on PR
+          command: >-
+            kubectl --kubeconfig {{ pr_kubeconfig }} -n {{ namespace }}
+            exec {{ pr_redis_pod }} -- sh -c 'redis-cli MGET prdr:site prdr:last'
+          register: pr_readback
+
+        - name: Show PR readback
+          debug:
+            var: pr_readback.stdout_lines
